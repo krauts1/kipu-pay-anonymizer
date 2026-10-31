@@ -15,6 +15,25 @@ if (!token) throw new Error('The source token is empty. No Frontier evaluation i
 
 function check(ok, id) { if (!ok) throw new Error(`${id} failed; details suppressed to avoid printing source values`); }
 function fold(value) { return value.normalize('NFKC').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase(); }
+function validatorFold(value) {
+  const confusables = { 'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y','і':'i','ј':'j','ѕ':'s','в':'b','н':'h','к':'k','м':'m','т':'t','ο':'o','α':'a','ρ':'p','ν':'v','ι':'i','ℓ':'l','ı':'i','ɑ':'a' };
+  return value.normalize('NFKC').replace(/[\u0430\u0435\u043E\u0440\u0441\u0445\u0443\u0456\u0458\u0455\u0432\u043D\u043A\u043C\u0442\u03BF\u03B1\u03C1\u03BD\u03B9\u2113\u0131\u0251]/gu, c => confusables[c] ?? c).replace(/\p{Cf}/gu, '').replace(/[\p{Zs}\t\r\n\v\f]/gu, ' ').replace(/ {2,}/g, ' ').normalize('NFD').replace(/\p{Mn}/gu, '').toLowerCase().replace(/ß/g, 'ss').replace(/ς/g, 'σ').replace(/ſ/g, 's');
+}
+function validatorContains(haystack, original) {
+  const digits = original.replace(/\D/gu, '');
+  if (digits.length >= 6 && digits.length >= 0.6 * original.length && !/[a-z]/i.test(original)) {
+    const compact = haystack.normalize('NFKC').replace(/(?<=\p{Nd})[\s.,'’`´·/\-–—_](?=\p{Nd})/gu, '');
+    const candidates = new Set([digits]); if (digits.length === 12 && digits.startsWith('57')) candidates.add(digits.slice(2));
+    return [...candidates].some(d => new RegExp(`(?<!\\p{Nd})(?:57)?${d}(?!\\p{Nd})`, 'u').test(compact));
+  }
+  const h = validatorFold(haystack), n = validatorFold(original);
+  if (/^[\p{L}\p{N}_ .'_-]+$/u.test(n) && /[a-z]/u.test(n)) {
+    if (new RegExp(`(?<![a-z0-9])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9])`, 'u').test(h)) return true;
+    const words = n.split(/\s+/u).filter(Boolean);
+    return words.length >= 2 && words.every(word => [...word].length >= 3) && new RegExp(`(?<![a-z0-9])${words.map(word => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[\\t\\n\\v\\f\\r \\x1c-\\x1f\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*')}(?![a-z0-9])`, 'u').test(h);
+  }
+  return h.includes(n);
+}
 function allText(records) { return JSON.stringify(records); }
 function digitPayloadPresent(text, payload) {
   const digits = payload.replace(/\D/g, '');
@@ -60,17 +79,18 @@ try {
         const record = JSON.parse(line);
         const walk = (value, path) => {
           if (typeof value === 'string') all.push([`${kind}.${path}`, value]);
-          else if (value && typeof value === 'object') for (const [key, child] of Object.entries(value)) if (key !== 'id') walk(child, path ? `${path}.${key}` : key);
+          else if (value && typeof value === 'object') for (const [key, child] of Object.entries(value)) if (key !== 'id') { all.push([`${kind}.${path}`, key]); walk(child, path ? `${path}.${key}` : key); }
         };
         walk(record, '');
       }
-      for (const line of lines.filter(item => item.includes('la forma original'))) {
-        const id = line.match(/entities\[([^\]]+)\]/)?.[1];
-        const entity = entities.find(item => item.entity_id === id);
+      const entityById = new Map(entities.map(entity => [String(entity.entity_id), entity]));
+      const issueIds = new Set(lines.filter(line => line.includes('la forma original')).map(line => line.match(/entities\[([^\]]+)\]/)?.[1]).filter(Boolean));
+      const kept = entities.filter(entity => entity.kept).flatMap(entity => entity.originals ?? []);
+      for (const id of issueIds) {
+        const entity = entityById.get(id);
         for (const original of entity?.originals ?? []) {
-          if (original.length < 3 || (!original.includes(' ') && !original.includes('@') && !/\d/.test(original))) continue;
-          const needle = fold(original);
-          for (const [field, value] of all) if (fold(value).includes(needle)) fieldHits.set(field, (fieldHits.get(field) ?? 0) + 1);
+          if ([...original].length < 3 || [...original].length === 1 && original[0].toUpperCase() === original[0] || kept.some(value => validatorContains(value, original))) continue;
+          for (const [field, value] of all) if (validatorContains(value, original)) fieldHits.set(field, (fieldHits.get(field) ?? 0) + 1);
         }
       }
     } catch { /* keep the validator failure summary safe */ }
