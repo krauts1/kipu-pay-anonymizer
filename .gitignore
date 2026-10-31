@@ -1,0 +1,10 @@
+.fuentes-token
+material-oficial/
+fuentes/
+output/
+node_modules/
+dist/
+identities.sqlite*
+jobs.json*
+tmp/
+docs/

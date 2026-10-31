@@ -1,0 +1,12 @@
+flowchart LR
+  K[POST /v1/run] --> A[API de fuentes]
+  A --> B[Lectores por formato]
+  B --> C[Registros y campos de origen]
+  J[POST /v1/anonymize] --> C
+  C --> D[Detección de PII]
+  D --> E[Reglas de identidad]
+  E <--> F[(SQLite: personas y seudónimos)]
+  E --> G[Sustitución por fragmentos]
+  G --> H[Controles de fuga, utilidad y estructura]
+  H -->|corrida completa| I[Cuatro archivos de salida]
+  H -->|lote en vivo| R[Respuesta: registros y entidades]
