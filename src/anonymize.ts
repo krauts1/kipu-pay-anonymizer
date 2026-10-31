@@ -6,12 +6,17 @@ import { planIndirect, type IndirectPlan } from './indirect.js';
 import { isKeptName } from './kept.js';
 
 type Alias = { person: Person; kind: string; original: string };
-type Edit = { start: number; end: number; text: string; person: Person; original: string; priority: number; kind?: string; quasi?: boolean };
+type NamePattern = { alias: Alias; regex: RegExp };
+type Edit = { start: number; end: number; text: string; person?: Person; original: string; priority: number; kind?: string; quasi?: boolean };
 const digitAliases = new Set(['cedula', 'phone', 'account']);
 const privateFields: Record<string, string> = { nombre_completo: 'name', nombre: 'name', agente: 'name', reporta_a: 'name', author: 'name', correo: 'email', email: 'email', celular: 'phone', telefono: 'phone', num_doc: 'cedula', cedula: 'cedula', documento: 'cedula', direccion: 'address', fecha_nacimiento: 'birth_iso', placa: 'plate', pasaporte: 'passport', cuenta: 'account' };
 const stableFields = new Set(['cliente_id', 'tx_id', 'radicado', 'id']);
 
-function caseLike(original: string, replacement: string): string { return original === original.toUpperCase() && /[A-Z]/.test(original) ? replacement.toUpperCase() : replacement; }
+function caseLike(original: string, replacement: string): string {
+  if (original === original.toUpperCase() && /[A-Z]/.test(original)) return replacement.toUpperCase();
+  if (original === original.toLowerCase() && /[a-z]/i.test(original)) return replacement.toLowerCase();
+  return replacement;
+}
 function formatLike(original: string, replacement: string, kind: string): string {
   if (kind === 'name') return caseLike(original, replacement);
   if (kind === 'plate') return caseLike(original, /[- ]/.test(original) ? replacement.replace(/(?<=^[A-Za-z]{3})/, original.includes('-') ? '-' : ' ') : replacement);
@@ -34,6 +39,7 @@ export class Anonymizer {
   private contextAliases = new Map<string, Person[]>();
   private contextMatcher?: RegExp;
   private threadContexts = new Map<string, Person>();
+  private namesByFirstToken = new Map<string, NamePattern[]>();
   private matcher?: RegExp;
   private indirect: Map<string, IndirectPlan>;
   private touched = new Set<string>();
@@ -42,6 +48,7 @@ export class Anonymizer {
   prepare(): void { this.rebuild(); }
   repair(leaks: { personId: string; value: string; kind: string }[]): void {
     for (const leak of leaks) this.store.addAlias(leak.personId, leak.kind, leak.value);
+    this.store.sanitizePseudonyms();
     this.rebuild();
   }
   private buildThreadContexts(chats: Ingested['chats'], uidByChat: Map<string, string>): void {
@@ -59,7 +66,7 @@ export class Anonymizer {
   private mark(person: Person, recordId: string, kind?: string): void { this.touched.add(person.id); this.store.mention(person.id, recordId); if (kind) this.store.markUsed(person.id, kind); }
 
   private rebuild(): void {
-    this.names.clear(); this.aliases.clear(); this.contextAliases.clear();
+    this.names.clear(); this.aliases.clear(); this.contextAliases.clear(); this.namesByFirstToken.clear();
     const people = this.store.people();
     for (const person of people) {
       if (isFullName(person.name)) {
@@ -68,6 +75,8 @@ export class Anonymizer {
         this.addAlias(person, 'name', person.name);
         const first = person.name.split(/\s+/)[0];
         if (first.length >= 4) this.addAlias(person, 'first_name', first);
+      } else if (person.name.trim().split(/\s+/).length === 1 && [...person.name].length >= 4) {
+        this.addAlias(person, 'first_name', person.name.trim());
       }
       for (const alias of person.identifiers) {
         if (['tx_id', 'radicado'].includes(alias.kind)) {
@@ -77,7 +86,18 @@ export class Anonymizer {
       }
     }
     const forms = new Map<string, { kind: string; original: string }>();
-    for (const aliases of this.aliases.values()) for (const alias of aliases) forms.set(`${alias.kind}:${keyForm(alias.original)}`, { kind: alias.kind, original: alias.original });
+    const nameForms = new Map<string, Alias>();
+    for (const aliases of this.aliases.values()) for (const alias of aliases) {
+      if (alias.kind === 'name' || alias.kind === 'first_name') nameForms.set(`${alias.person.id}:${alias.kind}:${keyForm(alias.original)}`, alias);
+      else forms.set(`${alias.kind}:${keyForm(alias.original)}`, { kind: alias.kind, original: alias.original });
+    }
+    for (const alias of nameForms.values()) {
+      const firstToken = keyForm(alias.original).match(/[\p{L}\p{N}_]+/u)?.[0];
+      if (!firstToken) continue;
+      const regex = new RegExp(`^${aliasPattern(alias.kind, alias.original)}(?![\\p{L}\\p{N}])`, 'iu');
+      const list = this.namesByFirstToken.get(firstToken) ?? [];
+      list.push({ alias, regex }); this.namesByFirstToken.set(firstToken, list);
+    }
     const ordered = [...forms.values()].sort((a, b) => b.original.length - a.original.length);
     this.matcher = ordered.length ? new RegExp(`(?<![\\p{L}\\p{N}])(?:${ordered.map(a => aliasPattern(a.kind, a.original)).join('|')})(?![\\p{L}\\p{N}])`, 'giu') : undefined;
     const contextValues = [...this.contextAliases.keys()].sort((a, b) => b.length - a.length);
@@ -176,7 +196,13 @@ export class Anonymizer {
     for (const record of [...data.chats, ...data.docs]) {
       const values = 'author' in record ? [record.text, ...record.attachments.map(a => a.filename)] : [record.filename, record.title, record.body, ...Object.values(record.metadata)];
       const metadataAuthor = 'metadata' in record ? record.metadata.author : undefined;
-      if (metadataAuthor && isFullName(metadataAuthor) && !metadataAuthor.includes('@') && !isKeptName(metadataAuthor) && !this.knownName(metadataAuthor)) this.store.create('live_name', `${record.id}:${keyForm(metadataAuthor)}`, metadataAuthor);
+      if (metadataAuthor && isFullName(metadataAuthor) && !metadataAuthor.includes('@') && !isKeptName(metadataAuthor)) {
+        let person = this.knownName(metadataAuthor) ?? this.store.byAlias('live_name', `${record.id}:${keyForm(metadataAuthor)}`);
+        if (!person) person = this.store.create('live_name', `${record.id}:${keyForm(metadataAuthor)}`, metadataAuthor);
+        const escaped = metadataAuthor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu');
+        for (const value of values) if (pattern.test(value)) this.store.addOriginal(person.id, metadataAuthor, 'name');
+      }
       for (const value of values) {
         const spans = detectExplicit(value);
         const introduced = spans.find(span => span.kind === 'name')?.value;
@@ -233,7 +259,15 @@ export class Anonymizer {
   }
   private byValue(value: string, context?: Person, role?: 'employee' | 'customer'): Person | undefined {
     for (const kind of ['email', 'phone', 'cedula', 'uid', 'plate', 'passport']) { const person = this.store.byAlias(kind, value); if (person) return person; }
-    return this.knownName(value, context, role);
+    const byName = this.knownName(value, context, role);
+    if (byName) return byName;
+    // Single-token names (e.g. chat authors) may match a known first name
+    const token = value.trim();
+    if (token.split(/\s+/).length === 1 && token.length >= 4 && !token.includes('@')) {
+      const firstNameMatches = this.aliases.get(keyForm(token))?.filter(a => a.kind === 'first_name');
+      if (firstNameMatches?.length === 1) return firstNameMatches[0].person;
+    }
+    return undefined;
   }
   private context(record: RecordValue, uid?: string): Person | undefined {
     if (uid) { const person = this.store.byAlias('uid', uid); if (person) return person; }
@@ -304,21 +338,54 @@ export class Anonymizer {
       const piiKind = span.kind === 'first_name' ? 'name' : span.kind;
       edits.push({ start: span.start, end: span.end, original: span.value, text: formatLike(span.value, pseudo, piiKind), person, priority: 5, kind: piiKind });
     }
+    const matchedAliases: { index: number; value: string; aliases: Alias[] }[] = [];
     if (this.matcher) for (const match of input.matchAll(this.matcher)) {
       const aliases = this.aliases.get(keyForm(match[0])) ?? this.aliases.get(keyForm(match[0].replace(/[_-]+/g, ' '))) ?? this.aliases.get(match[0].replace(/\D/g, '')) ?? [];
+      matchedAliases.push({ index: match.index, value: match[0], aliases });
+    }
+    for (const token of input.matchAll(/[\p{L}\p{N}_]+/gu)) {
+      const fullToken = token[0];
+      const parts = fullToken.split(/[_-]+/);
+      let accumulated = 0;
+      for (const part of parts) {
+        if (part.length < 2) { accumulated += part.length + 1; continue; }
+        const patterns = this.namesByFirstToken.get(keyForm(part)) ?? [];
+        for (const candidate of patterns) {
+          const slice = input.slice(token.index + accumulated);
+          const match = candidate.regex.exec(slice);
+          if (!match) continue;
+          const aliases = this.aliases.get(keyForm(match[0])) ?? [candidate.alias];
+          matchedAliases.push({ index: token.index + accumulated + match.index, value: match[0], aliases });
+        }
+        accumulated += part.length + 1;
+      }
+    }
+    matchedAliases.sort((a, b) => a.index - b.index || b.value.length - a.value.length);
+    for (const match of matchedAliases) {
+      const aliases = match.aliases;
       const anchoredFirstNames = aliases.filter(a => a.kind === 'first_name' && anchoredIds.has(a.person.id));
       let chosen = anchoredFirstNames.length === 1 ? anchoredFirstNames[0] : aliases.find(a => a.person.id === local?.id) ?? (aliases.length === 1 ? aliases[0] : undefined);
-      if (chosen?.kind === 'first_name' && !anchoredIds.has(chosen.person.id)) continue;
+      const firstNameAliases = aliases.filter(a => a.kind === 'first_name');
+      const possiblePeople = new Set(aliases.map(alias => alias.person.id));
+      if (chosen?.kind === 'first_name' && !anchoredIds.has(chosen.person.id) && possiblePeople.size > 1) chosen = undefined;
+      if (!chosen && firstNameAliases.length) {
+        if (firstNameAliases.length === 1 && possiblePeople.size === 1) chosen = firstNameAliases[0];
+        else {
+          const replacement = formatLike(match.value, '[persona]', 'name');
+          edits.push({ start: match.index, end: match.index + match.value.length, original: match.value, text: replacement, priority: 1, quasi: true });
+          continue;
+        }
+      }
       if (!chosen && aliases.length) {
         if (aliases[0].kind === 'first_name') continue;
         const kind = aliases[0].kind;
-        const person = this.createLive(kind, match[0], recordId);
-        chosen = { person, kind, original: match[0] };
+        const person = this.createLive(kind, match.value, recordId);
+        chosen = { person, kind, original: match.value };
       }
       if (!chosen) continue;
       const pseudo = chosen.kind === 'name' ? chosen.person.pseudonym : chosen.kind === 'first_name' ? chosen.person.pseudonym.split(' ')[0] : this.store.pseudonym(chosen.person.id, chosen.kind, chosen.original);
       const piiKind = chosen.kind === 'first_name' ? 'name' : chosen.kind;
-      edits.push({ start: match.index, end: match.index + match[0].length, original: match[0], text: formatLike(match[0], pseudo, piiKind), person: chosen.person, priority: chosen.person.id === local?.id ? 4 : 2, kind: piiKind });
+      edits.push({ start: match.index, end: match.index + match.value.length, original: match.value, text: formatLike(match.value, pseudo, piiKind), person: chosen.person, priority: chosen.person.id === local?.id ? 4 : 2, kind: piiKind });
     }
     for (const match of input.matchAll(/<@([A-Z0-9]+)>/g)) {
       const person = this.store.byAlias('uid', match[1]); if (!person) continue;
@@ -330,8 +397,8 @@ export class Anonymizer {
     let result = input;
     for (const edit of selected.sort((a, b) => b.start - a.start)) {
       result = result.slice(0, edit.start) + edit.text + result.slice(edit.end);
-      if (!edit.quasi) this.store.addOriginal(edit.person.id, edit.original, edit.kind ?? 'name');
-      this.mark(edit.person, recordId, edit.kind);
+      if (edit.person && !edit.quasi) this.store.addOriginal(edit.person.id, edit.original, edit.kind ?? 'name');
+      if (edit.person) this.mark(edit.person, recordId, edit.kind);
     }
     return result;
   }

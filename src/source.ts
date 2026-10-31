@@ -85,10 +85,18 @@ async function normalizeDoc(info: DocIndex, bytes: Uint8Array): Promise<DocRecor
       const content = await parser.getText();
       const details = await parser.getInfo();
       body = content.text;
-      const raw = (details as unknown as { info?: Record<string, unknown> }).info ?? {};
+      const raw = (details as unknown as { info?: Record<string, unknown> }).info ?? (details as unknown as Record<string, unknown>);
       const allowed = new Set(['title', 'author', 'subject', 'keywords', 'creator', 'producer', 'creationdate', 'moddate']);
       for (const [key, value] of Object.entries(raw)) if (allowed.has(key.toLowerCase()) && typeof value === 'string' && value.trim()) metadata[key.toLowerCase()] = value;
-      const xmp = (details.metadata as unknown as { getAll?: () => Record<string, unknown> } | undefined)?.getAll?.() ?? {};
+      const xmpMeta = (details as unknown as { metadata?: Record<string, unknown> | { getAll?: () => Record<string, unknown> } | undefined }).metadata;
+      let xmp: Record<string, unknown> = {};
+      if (xmpMeta && typeof xmpMeta === 'object') {
+        if ('getAll' in xmpMeta && typeof (xmpMeta as { getAll?: () => Record<string, unknown> }).getAll === 'function') {
+          xmp = (xmpMeta as { getAll?: () => Record<string, unknown> }).getAll!();
+        } else {
+          xmp = xmpMeta as Record<string, unknown>;
+        }
+      }
       const xmpNames: Record<string, string> = { 'dc:title': 'title', 'dc:creator': 'author', 'dc:description': 'subject', 'pdf:keywords': 'keywords' };
       for (const [key, value] of Object.entries(xmp)) {
         const mapped = xmpNames[key.toLowerCase()];

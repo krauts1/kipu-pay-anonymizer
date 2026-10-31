@@ -53,9 +53,14 @@ const temporary = await mkdtemp(join(tmpdir(), 'frontier-public-qa-'));
 try {
   const outputDir = join(temporary, 'output');
   const counts = await runPipeline(sourcesUrl, token, outputDir, join(temporary, 'identities.sqlite'));
+  // Download current record_index for validation (API may have been updated)
+  const currentIndex = await (await fetch(`${sourcesUrl}/record_index`, { headers: { Authorization: `Bearer ${token}` } })).json();
+  const publicDir = join(temporary, 'public');
+  await (await import('node:fs/promises')).mkdir(publicDir, { recursive: true });
+  await (await import('node:fs/promises')).writeFile(join(publicDir, 'record_index.json'), JSON.stringify(currentIndex));
   let validatorOutput = '';
   try {
-    validatorOutput = execFileSync(process.execPath, [join(root, 'material-oficial/validar.mjs'), outputDir, '--public', join(root, 'material-oficial')], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    validatorOutput = execFileSync(process.execPath, [join(root, 'material-oficial/validar.mjs'), outputDir, '--public', publicDir], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   } catch (error) {
     const output = String(error.stdout ?? '');
     const count = output.match(/FALLA: (\d+) problema/);

@@ -54,7 +54,10 @@ export async function runPipeline(sourcesUrl: string, token: string, outputDir: 
       if (!leaks.length) break;
       if (attempt === 1) {
         const counts = new Map<string, number>();
-        for (const leak of leaks) for (const field of leak.fields) counts.set(`${field}/${leak.kind}`, (counts.get(`${field}/${leak.kind}`) ?? 0) + 1);
+        for (const leak of leaks) for (const field of leak.fields) {
+          const key = `${leak.personId}/${leak.sources.join('+')}/${field}/${leak.kind}`;
+          counts.set(key, (counts.get(key) ?? 0) + 1);
+        }
         const summary = [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([field, count]) => `${field}:${count}`).join(', ');
         throw new Error(`Privacy audit found ${leaks.length} unresolved source forms (${summary})`);
       }

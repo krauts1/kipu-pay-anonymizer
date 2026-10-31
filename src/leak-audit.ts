@@ -2,7 +2,7 @@ import type { RecordValue } from './types.js';
 import type { IdentityStore } from './identity.js';
 import { keptEntities } from './kept.js';
 
-export type Leak = { personId: string; value: string; kind: string; fields: string[] };
+export type Leak = { personId: string; value: string; kind: string; fields: string[]; sources: string[] };
 
 function fold(value: string): string {
   const confusables: Record<string, string> = { 'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y','і':'i','ј':'j','ѕ':'s','в':'b','н':'h','к':'k','м':'m','т':'t','ο':'o','α':'a','ρ':'p','ν':'v','ι':'i','ℓ':'l','ı':'i','ɑ':'a' };
@@ -13,9 +13,14 @@ function compileMatcher(original: string, kind: string): ((text: string) => bool
   const needle = fold(original);
   if (!needle) return undefined;
   if (kind === 'name') {
-    // A full name has enough context for a deterministic exact audit. Single names
-    // are deliberately excluded here because they create many false alarms.
-    if (needle.split(' ').length < 2 || needle.length < 8) return undefined;
+    if (needle.split(' ').length < 2) {
+      // The official validator checks lower-case standalone originals but ignores
+      // title-case single names. Match that rule to catch real first-name leaks.
+      if (original !== original.toLowerCase() || needle.length < 3) return undefined;
+      const single = new RegExp(`(?<![a-z0-9])${escapeRegex(needle)}(?![a-z0-9])`, 'u');
+      return text => single.test(text);
+    }
+    if (needle.length < 8) return undefined;
     const parts = needle.split(' ').map(escapeRegex);
     const pattern = new RegExp(`(?<![a-z0-9])${parts.join('[\\s\\p{Zs}]*')}(?![a-z0-9])`, 'u');
     return text => pattern.test(text);
@@ -43,7 +48,7 @@ function compileMatcher(original: string, kind: string): ((text: string) => bool
 function auditable(original: { value: string; kind: string }): boolean {
   const value = fold(original.value);
   if (value.length < 3) return false;
-  if (original.kind === 'name' && !value.includes(' ')) return false;
+  if (original.kind === 'name' && !value.includes(' ') && original.value !== original.value.toLowerCase()) return false;
   return true;
 }
 function values(record: RecordValue): { field: string; text: string }[] {
@@ -53,7 +58,19 @@ function values(record: RecordValue): { field: string; text: string }[] {
 }
 
 export function findLeaks(records: RecordValue[], store: IdentityStore): Leak[] {
-  const fields = records.flatMap(values).map(item => ({ ...item, folded: fold(item.text) }));
+  const sourceOf = (record: RecordValue) => 'author' in record ? 'chats' : 'body' in record ? 'docs' : record.id.split(':')[0];
+  const fields = records.flatMap(record => values(record).map(item => ({ ...item, source: sourceOf(record), folded: fold(item.text) })));
+  // Most corpus originals are names. Index their first token once so every
+  // name is checked only against fields that can contain it.
+  const fieldsByToken = new Map<string, typeof fields>();
+  for (const item of fields) {
+    const tokens = new Set(item.folded.match(/[\p{L}\p{N}_]+/gu) ?? []);
+    for (const token of tokens) {
+      const list = fieldsByToken.get(token) ?? [];
+      list.push(item);
+      fieldsByToken.set(token, list);
+    }
+  }
   const kept = keptEntities(records).flatMap(entity => entity.originals).map(fold);
   const found = new Map<string, Leak>();
   for (const original of store.knownOriginals()) {
@@ -61,8 +78,12 @@ export function findLeaks(records: RecordValue[], store: IdentityStore): Leak[] 
     if (kept.some(value => value.includes(fold(original.value)))) continue;
     const matches = compileMatcher(original.value, original.kind);
     if (!matches) continue;
-    const matchedFields = fields.filter(item => matches(item.folded)).map(item => item.field);
-    if (matchedFields.length) found.set(`${original.personId}\0${original.kind}\0${original.value}`, { ...original, fields: [...new Set(matchedFields)] });
+    const firstToken = fold(original.value).match(/[\p{L}\p{N}_]+/u)?.[0];
+    const candidates = original.kind === 'name' && firstToken ? fieldsByToken.get(firstToken) ?? [] : fields;
+    const hits = candidates.filter(item => matches(item.folded));
+    if (hits.length) {
+      found.set(`${original.personId}\0${original.kind}\0${original.value}`, { ...original, fields: [...new Set(hits.map(item => item.field))], sources: [...new Set(hits.map(item => item.source))] });
+    }
   }
   return [...found.values()];
 }

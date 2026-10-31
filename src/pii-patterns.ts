@@ -8,11 +8,15 @@ const labeled = [
   { kind: 'plate', re: /\b(?:placa|matr[ií]cula)\s*[:#-]?\s*([A-Z]{3}[- ]?\d{3})\b/gi },
   { kind: 'passport', re: /\b(?:pasaporte|passport)\s*[:#-]?\s*([A-Z]{1,2}\d{7,9})\b/gi },
 ] as const;
-const namedPerson = /\b(?:me llamo|mi nombre es|soy|preparado por|firmado por|atendido por|contacto:|agente:|cliente:)\s+([A-ZÁÉÍÓÚÑ][\p{L}ÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][\p{L}ÁÉÍÓÚÑáéíóúñ]+){1,3})/giu;
+const namedPerson = /\b(?:me llamo|mi nombre es|soy|preparado por|elaborado por|revisado por|aprobado por|firmado por|atendido por|contacto:|agente:|cliente:)\s+([A-ZÁÉÍÓÚÑ][\p{L}ÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][\p{L}ÁÉÍÓÚÑáéíóúñ]+){1,3})/giu;
+const formalAddress = /\b(?:Señor|Señora|Doctor|Doctora|Ing\.?|Dra\.?)\s+([A-ZÁÉÍÓÚÑ][\p{L}ÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][\p{L}ÁÉÍÓÚÑáéíóúñ]+){1,3})/giu;
+const signatureBlock = /\b(?:Cordialmente|Atentamente|Saludos cordiales)[,.]?\s*(?:\n|\r)?\s*([A-ZÁÉÍÓÚÑ][\p{L}ÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][\p{L}ÁÉÍÓÚÑáéíóúñ]+){1,3})/giu;
+const upperName = /\b([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,}){1,3})(?=\s*(?:\n|$|[,.;]))/gu;
 const contextualFirstName = /\b(?:hola|hi|soy|me llamo)\s+([A-ZÁÉÍÓÚÑ][\p{L}ÁÉÍÓÚÑáéíóúñ]{3,})\b/giu;
 const personAttribute = /\b(?:data-person|data-author|data-name|data-contact|author)\s*=\s*(["'])([^"']+)\1/giu;
 const htmlComment = /<!--[\s\S]*?-->/g;
 const genericMailboxes = new Set(['soporte', 'support', 'info', 'ventas', 'contacto', 'contact', 'admin', 'noreply', 'no-reply', 'facturacion']);
+const upperStopWords = new Set(['ASUNTO', 'NOTA', 'NOTAS', 'REFERENCIA', 'ESTADO', 'FECHA', 'LUGAR', 'DOCUMENTO', 'PAGINA', 'TOTAL', 'CONCEPTO', 'DETALLE', 'ITEM', 'VALOR', 'CUENTA', 'BANCO', 'SUCURSAL', 'OFICINA', 'CIUDAD', 'DIRECCION', 'TELEFONO', 'CELULAR', 'CORREO', 'EMAIL', 'NOMBRE', 'APELLIDO', 'CLIENTE', 'USUARIO', 'CODIGO', 'REF', 'NUMERO', 'POR', 'OF', 'THE', 'AND', 'FOR']);
 const internationalMobile = /(?<!\d)\+57[\s().-]*3\d{2}[\s().-]*\d{3}[\s().-]*\d{4}(?!\d)/g;
 
 export function canonicalSpokenEmail(value: string): string { return value.replace(/\s+arroba\s+/i, '@').replace(/\s+punto\s+/gi, '.').replace(/\s+/g, ''); }
@@ -30,6 +34,23 @@ export function detectExplicit(text: string): DetectedSpan[] {
   for (const match of text.matchAll(namedPerson)) {
     const value = match[1]; const start = match.index + match[0].lastIndexOf(value);
     if (!/^[A-ZÁÉÍÓÚÑ]/.test(value)) continue;
+    spans.push({ start, end: start + value.length, value, kind: 'name', strong: false });
+  }
+  for (const match of text.matchAll(formalAddress)) {
+    const value = match[1]; const start = match.index + match[0].lastIndexOf(value);
+    if (!/^[A-ZÁÉÍÓÚÑ]/.test(value)) continue;
+    spans.push({ start, end: start + value.length, value, kind: 'name', strong: false });
+  }
+  for (const match of text.matchAll(signatureBlock)) {
+    const value = match[1]; const start = match.index + match[0].lastIndexOf(value);
+    if (!/^[A-ZÁÉÍÓÚÑ]/.test(value)) continue;
+    spans.push({ start, end: start + value.length, value, kind: 'name', strong: false });
+  }
+  for (const match of text.matchAll(upperName)) {
+    const value = match[1]; const start = match.index + match[0].lastIndexOf(value);
+    if (!/^[A-ZÁÉÍÓÚÑ]/.test(value)) continue;
+    const firstWord = value.split(/\s+/)[0].toUpperCase();
+    if (upperStopWords.has(firstWord) || upperStopWords.has(value.toUpperCase())) continue;
     spans.push({ start, end: start + value.length, value, kind: 'name', strong: false });
   }
   for (const match of text.matchAll(contextualFirstName)) {

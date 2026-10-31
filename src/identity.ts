@@ -152,6 +152,52 @@ export class IdentityStore {
     this.db.prepare('INSERT INTO substitutions(person_id,kind,value) VALUES(?,?,?)').run(id, kind, value);
     return value;
   }
+  sanitizePseudonyms(): void {
+    const originals = this.knownOriginals();
+    const people = this.people();
+    // Build a word index for fast filtering: which originals contain each word
+    const wordIndex = new Map<string, { personId: string; value: string }[]>();
+    for (const o of originals) {
+      const words = normForLeak(o.value).match(/[\p{L}\p{N}]+/gu) ?? [];
+      for (const w of words) {
+        if (w.length < 3) continue;
+        const list = wordIndex.get(w) ?? [];
+        list.push(o);
+        wordIndex.set(w, list);
+      }
+    }
+    const allPseudonyms = people.map(p => ({ id: p.id, name: p.name, pseudonym: p.pseudonym, gender: this.db.prepare('SELECT gender FROM persons WHERE id=?').get(p.id) as { gender: string } | undefined }));
+    for (const person of allPseudonyms) {
+      const ownOriginals = new Set(originals.filter(o => o.personId === person.id).map(o => o.value));
+      const pseudoWords = normForLeak(person.pseudonym).match(/[\p{L}\p{N}]+/gu) ?? [];
+      const candidates = new Set<string>();
+      for (const w of pseudoWords) {
+        if (w.length < 3) continue;
+        for (const o of wordIndex.get(w) ?? []) {
+          if (o.personId !== person.id) candidates.add(o.value);
+        }
+      }
+      const conflicting = [...candidates].filter(v => containsOriginal(person.pseudonym, v));
+      if (!conflicting.length) continue;
+      // Regenerate with a fresh seed to avoid the collision
+      const gender = person.gender?.gender as 'female' | 'male' | 'unknown';
+      const context = nameContext(person.name, undefined);
+      let attempt = 0;
+      let newPseudonym = newName(`${person.id}:sanitize`, gender, context, attempt);
+      while (
+        this.db.prepare('SELECT 1 FROM persons WHERE pseudonym=? AND id<>?').get(newPseudonym, person.id) ||
+        this.originalConflicts(newPseudonym) ||
+        keyForm(newPseudonym) === keyForm(person.name) ||
+        originals.some(o => o.personId !== person.id && containsOriginal(newPseudonym, o.value))
+      ) {
+        if (++attempt > 2000) throw new Error(`Unable to sanitize pseudonym for ${person.id}`);
+        newPseudonym = newName(`${person.id}:sanitize`, gender, context, attempt);
+      }
+      this.db.prepare('UPDATE persons SET pseudonym=? WHERE id=?').run(newPseudonym, person.id);
+      // Also update any substitution that defaulted to the old pseudonym
+      this.db.prepare("UPDATE substitutions SET value=? WHERE person_id=? AND kind='name'").run(newPseudonym, person.id);
+    }
+  }
   people(): Person[] {
     const rows = this.db.prepare('SELECT id FROM persons').all() as { id: string }[];
     return rows.map(row => this.byId(row.id)!);
