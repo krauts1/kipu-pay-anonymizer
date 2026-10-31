@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { runPipeline, anonymizeLive, outputFiles } from './pipeline.js';
+import { Worker } from 'node:worker_threads';
+import { anonymizeLive, outputFiles } from './pipeline.js';
 import { IdentityStore } from './identity.js';
 import type { RecordCounts, RecordValue, SourceKind } from './types.js';
 
@@ -37,6 +38,19 @@ function validRecord(source: SourceKind, record: unknown): record is RecordValue
   return ['clientes', 'transacciones', 'pqrs', 'empleados'].includes(String(r.table)) && stringMap(r.columns);
 }
 function safeError(error: unknown): string { return error instanceof Error ? error.message.replace(/Bearer\s+\S+/gi, 'Bearer [hidden]') : 'Unexpected error'; }
+function runInWorker(sourcesUrl: string, token: string): Promise<RecordCounts> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./run-worker.js', import.meta.url), { workerData: { sourcesUrl, token, outputDir, dbFile } });
+    let settled = false;
+    worker.once('message', (result: { records?: RecordCounts; error?: string }) => {
+      settled = true;
+      if (result.records) resolve(result.records);
+      else reject(new Error(result.error ?? 'Worker did not return record counts'));
+    });
+    worker.once('error', error => { if (!settled) { settled = true; reject(error); } });
+    worker.once('exit', code => { if (!settled) { settled = true; reject(new Error(`Worker exited with code ${code}`)); } });
+  });
+}
 function persistJobs(): void {
   const temporary = `${jobsFile}.next`;
   writeFileSync(temporary, JSON.stringify([...jobs]), { mode: 0o600 });
@@ -65,7 +79,7 @@ const server = createServer(async (req, res) => {
       const sourcesUrl = data.sources_url; const token = data.token;
       setImmediate(async () => {
         const started = Date.now(); job.status = 'running'; job.started_at = new Date(started).toISOString(); persistJobs();
-        try { job.records = await runPipeline(sourcesUrl, token, outputDir, dbFile); job.status = 'done'; }
+        try { job.records = await runInWorker(sourcesUrl, token); job.status = 'done'; }
         catch (error) { job.status = 'failed'; job.error = safeError(error); }
         finally { job.finished_at = new Date().toISOString(); job.cost = { tokens_in: 0, tokens_out: 0, seconds: (Date.now() - started) / 1000 }; running = false; activeJobId = undefined; persistJobs(); }
       });
